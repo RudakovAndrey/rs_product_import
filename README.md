@@ -72,7 +72,7 @@ drush rs-product-import:status
 ## Notes
 
 - Products are matched on reruns by `field_old_id` plus `field_cat_number`.
-- Product categories are resolved by taxonomy term `field_old_id`.
+- Product categories are resolved by original category IDs from `old_category_ids` and taxonomy term `field_old_id`.
 - Repeated old category IDs are disambiguated by source root categories.
 - The importer attaches the target category and its ancestors to keep parent categories populated after tree changes.
 - Cross-group fields are intentionally not touched.

@@ -178,7 +178,7 @@ class ProductImportCommands extends DrushCommands {
 
       $this->output()->writeln("[{$processed}] resolving categories {$label}");
       $category_ids = $this->resolveCategoryTargetIds($product);
-      if (!$category_ids && !empty($product['canonical_category_old_ids'])) {
+      if (!$category_ids && $this->productHasCategoryIds($product)) {
         $missing_categories++;
       }
 
@@ -612,13 +612,13 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
-   * Resolves category term IDs and all their ancestors.
+   * Resolves original category term IDs and all their ancestors.
    */
   protected function resolveCategoryTargetIds(array $product): array {
     $source = (string) ($product['source'] ?? '');
     $target_ids = [];
 
-    foreach (($product['canonical_category_old_ids'] ?? []) as $old_id) {
+    foreach ($this->productOriginalCategoryOldIds($product) as $old_id) {
       $term = $this->findTermByOldId((string) $old_id, $source);
       if (!$term) {
         continue;
@@ -629,6 +629,23 @@ class ProductImportCommands extends DrushCommands {
     }
 
     return array_values($target_ids);
+  }
+
+  /**
+   * Returns original category IDs from product JSON.
+   */
+  protected function productOriginalCategoryOldIds(array $product): array {
+    if (!empty($product['old_category_ids']) && is_array($product['old_category_ids'])) {
+      return $product['old_category_ids'];
+    }
+    return $product['canonical_category_old_ids'] ?? [];
+  }
+
+  /**
+   * Checks whether a product row has category IDs.
+   */
+  protected function productHasCategoryIds(array $product): bool {
+    return !empty($this->productOriginalCategoryOldIds($product));
   }
 
   /**
