@@ -339,6 +339,70 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
+   * Deletes exact duplicate product nodes with equal old ID and catalog number.
+   *
+   * @command rs-product-import:delete-exact-duplicates
+   * @aliases rspided
+   * @option dry-run Print what would be deleted without deleting nodes.
+   * @option limit Maximum duplicate groups to process. Use 0 for all.
+   * @option output Write the report to this file path.
+   */
+  public function deleteExactDuplicates(array $options = [
+    'dry-run' => TRUE,
+    'limit' => 50,
+    'output' => NULL,
+  ]): void {
+    $dry_run = (bool) ($options['dry-run'] ?? TRUE);
+    $groups = $this->loadExactDuplicateGroups($options);
+    $storage = $this->entityTypeManager->getStorage('node');
+    $lines = [];
+    $deleted = 0;
+    $kept = 0;
+    $skipped = 0;
+
+    $lines[] = 'Exact duplicate groups: ' . count($groups);
+    $lines[] = 'Dry run: ' . ($dry_run ? 'yes' : 'no');
+
+    foreach ($groups as $group) {
+      /** @var \Drupal\node\Entity\Node[] $nodes */
+      $nodes = $storage->loadMultiple($group['nids']);
+      $differences = $this->nodeFieldDifferences($nodes, $this->exactDuplicateCompareFields());
+      if ($differences) {
+        $skipped++;
+        $lines[] = '';
+        $lines[] = 'Skipped changed group old_id=' . $group['old_id'] . ' cat_number=' . $group['cat_number'] . ' nids=' . implode(',', $group['nids']);
+        $lines[] = 'Changed fields: ' . implode(', ', array_keys($differences));
+        continue;
+      }
+
+      $keep_nid = min(array_keys($nodes));
+      $delete_nids = array_values(array_diff(array_keys($nodes), [$keep_nid]));
+      $kept++;
+      $deleted += count($delete_nids);
+
+      $lines[] = '';
+      $lines[] = 'Duplicate group old_id=' . $group['old_id'] . ' cat_number=' . $group['cat_number'];
+      $lines[] = 'Keep nid=' . $keep_nid . '; delete nids=' . implode(',', $delete_nids);
+
+      if (!$dry_run) {
+        foreach ($delete_nids as $nid) {
+          if (isset($nodes[$nid])) {
+            $nodes[$nid]->delete();
+          }
+        }
+      }
+    }
+
+    $lines[] = '';
+    $lines[] = 'Groups processed: ' . count($groups);
+    $lines[] = 'Groups deleted from: ' . $kept;
+    $lines[] = 'Groups skipped because fields differ: ' . $skipped;
+    $lines[] = 'Nodes ' . ($dry_run ? 'to delete' : 'deleted') . ': ' . $deleted;
+
+    $this->writeDuplicateDiffReport($lines, (string) ($options['output'] ?? ''));
+  }
+
+  /**
    * Imports original CKT and URC taxonomy trees without restructuring.
    *
    * @command rs-product-import:import-taxonomy
@@ -508,6 +572,83 @@ class ProductImportCommands extends DrushCommands {
       $groups[$cat_number] = array_map('intval', $nid_query->execute()->fetchCol());
     }
     return $groups;
+  }
+
+  /**
+   * Loads duplicate groups by old ID and catalog number.
+   */
+  protected function loadExactDuplicateGroups(array $options): array {
+    $database = \Drupal::database();
+    $query = $database->select('node_field_data', 'n');
+    $query->innerJoin('node__field_old_id', 'old_id', 'old_id.entity_id = n.nid AND old_id.deleted = 0');
+    $query->innerJoin('node__field_cat_number', 'cat', 'cat.entity_id = n.nid AND cat.deleted = 0');
+    $query->addField('old_id', 'field_old_id_value', 'old_id');
+    $query->addField('cat', 'field_cat_number_value', 'cat_number');
+    $query->addExpression('COUNT(n.nid)', 'qty');
+    $query->condition('n.type', 'product');
+    $query->isNotNull('old_id.field_old_id_value');
+    $query->isNotNull('cat.field_cat_number_value');
+    $query->condition('cat.field_cat_number_value', '', '<>');
+    $query->groupBy('old_id.field_old_id_value');
+    $query->groupBy('cat.field_cat_number_value');
+    $query->having('COUNT(n.nid) > 1');
+    $query->orderBy('qty', 'DESC');
+    $query->orderBy('old_id', 'ASC');
+    $query->orderBy('cat_number', 'ASC');
+    $limit = (int) ($options['limit'] ?? 50);
+    if ($limit > 0) {
+      $query->range(0, $limit);
+    }
+
+    $groups = [];
+    foreach ($query->execute() as $row) {
+      $nid_query = $database->select('node_field_data', 'n');
+      $nid_query->innerJoin('node__field_old_id', 'old_id', 'old_id.entity_id = n.nid AND old_id.deleted = 0');
+      $nid_query->innerJoin('node__field_cat_number', 'cat', 'cat.entity_id = n.nid AND cat.deleted = 0');
+      $nid_query->fields('n', ['nid']);
+      $nid_query->condition('n.type', 'product');
+      $nid_query->condition('old_id.field_old_id_value', $row->old_id);
+      $nid_query->condition('cat.field_cat_number_value', $row->cat_number);
+      $nid_query->orderBy('n.nid', 'ASC');
+      $nids = array_map('intval', $nid_query->execute()->fetchCol());
+      if (count($nids) > 1) {
+        $groups[] = [
+          'old_id' => (string) $row->old_id,
+          'cat_number' => (string) $row->cat_number,
+          'nids' => $nids,
+        ];
+      }
+    }
+    return $groups;
+  }
+
+  /**
+   * Fields that must match before exact duplicate deletion.
+   */
+  protected function exactDuplicateCompareFields(): array {
+    return [
+      'title',
+      'status',
+      'field_title',
+      'field_display_title',
+      'field_cat_number',
+      'field_brand',
+      'field_stock_available',
+      'field_not_for_sale',
+      'field_catalog',
+      'body',
+      'field_parameters',
+      'field_applicability',
+      'field_models_applicability',
+      'field_marks',
+      'model',
+      'price',
+      'cost',
+      'weight',
+      'dimensions',
+      'uc_product_image',
+      'field_is_exist_img',
+    ];
   }
 
   /**
