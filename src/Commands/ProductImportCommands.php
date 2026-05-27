@@ -75,6 +75,9 @@ class ProductImportCommands extends DrushCommands {
    * @option dry-run Validate and print counters without saving nodes.
    * @option log-every Print progress every N products.
    * @option stop-after Stop after processing N products in this run.
+   * @option resume Continue from the last saved import progress offset.
+   * @option reset-progress Clear saved import progress before running.
+   * @option state-file Progress state JSON file path. Defaults to Drupal temporary directory.
    */
   public function import(array $options = [
     'file' => NULL,
@@ -84,7 +87,27 @@ class ProductImportCommands extends DrushCommands {
     'dry-run' => FALSE,
     'log-every' => 100,
     'stop-after' => NULL,
+    'resume' => FALSE,
+    'reset-progress' => FALSE,
+    'state-file' => NULL,
   ]): void {
+    $state_file = $this->progressStateFile($options);
+    if (!empty($options['reset-progress'])) {
+      $this->clearProgressState($state_file);
+      $this->output()->writeln("Import progress reset: {$state_file}");
+    }
+    if (!empty($options['resume'])) {
+      $state = $this->readProgressState($state_file);
+      if (isset($state['next_offset'])) {
+        $options['offset'] = (int) $state['next_offset'];
+        $this->output()->writeln("Resuming import from offset {$options['offset']} using {$state_file}");
+      }
+      else {
+        $this->output()->writeln("No saved progress found in {$state_file}; starting from offset " . (int) $options['offset']);
+      }
+    }
+
+    $base_offset = max(0, (int) ($options['offset'] ?? 0));
     $products = $this->loadProducts($options);
     $this->buildTermLookup();
     $this->buildExistingProductLookup();
@@ -100,8 +123,10 @@ class ProductImportCommands extends DrushCommands {
     $processed = 0;
 
     $this->output()->writeln('RS product import started.');
+    $this->output()->writeln('Base offset: ' . $base_offset);
     $this->output()->writeln('Products selected: ' . count($products));
     $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
+    $this->output()->writeln('Progress state file: ' . $state_file);
 
     foreach ($products as $index => $product) {
       if ($stop_after !== NULL && $processed >= $stop_after) {
@@ -110,7 +135,9 @@ class ProductImportCommands extends DrushCommands {
       }
 
       $processed++;
-      $label = $this->productDebugLabel($product, $index);
+      $absolute_index = $base_offset + $index;
+      $next_offset = $absolute_index + 1;
+      $label = $this->productDebugLabel($product, $absolute_index);
       if ($processed === 1 || $processed % $log_every === 0) {
         $this->output()->writeln("[{$processed}/" . count($products) . "] processing {$label}");
       }
@@ -118,6 +145,7 @@ class ProductImportCommands extends DrushCommands {
       if (empty($product['title']) || empty($product['source']) || empty($product['source_id'])) {
         $this->output()->writeln("[{$processed}] skipped invalid product {$label}");
         $skipped++;
+        $this->writeProgressState($state_file, $next_offset, $label, 'skipped_invalid');
         continue;
       }
 
@@ -126,6 +154,7 @@ class ProductImportCommands extends DrushCommands {
       if ($node && !$allow_update) {
         $this->output()->writeln("[{$processed}] skipped existing node nid=" . $node->id() . " {$label}");
         $skipped++;
+        $this->writeProgressState($state_file, $next_offset, $label, 'skipped_existing');
         continue;
       }
 
@@ -152,9 +181,11 @@ class ProductImportCommands extends DrushCommands {
         $this->output()->writeln("[{$processed}] saving node {$label}");
         $node->save();
         $this->output()->writeln("[{$processed}] saved node nid=" . $node->id() . " {$label}");
+        $this->writeProgressState($state_file, $next_offset, $label, $is_new ? 'created' : 'updated', (int) $node->id());
       }
       else {
         $this->output()->writeln("[{$processed}] dry-run passed {$label}");
+        $this->writeProgressState($state_file, $next_offset, $label, 'dry_run');
       }
 
       $is_new ? $created++ : $updated++;
@@ -531,6 +562,58 @@ class ProductImportCommands extends DrushCommands {
     $this->output()->writeln($title);
     foreach ($items as $item) {
       $this->output()->writeln('- ' . $item);
+    }
+  }
+
+  /**
+   * Gets the import progress state file path.
+   */
+  protected function progressStateFile(array $options): string {
+    if (!empty($options['state-file'])) {
+      return (string) $options['state-file'];
+    }
+    $temporary = \Drupal::service('file_system')->realpath('temporary://');
+    if (!$temporary) {
+      $temporary = sys_get_temp_dir();
+    }
+    return rtrim($temporary, '/\\') . DIRECTORY_SEPARATOR . 'rs_product_import_progress.json';
+  }
+
+  /**
+   * Reads the saved import progress state.
+   */
+  protected function readProgressState(string $state_file): array {
+    if (!file_exists($state_file)) {
+      return [];
+    }
+    $state = json_decode((string) file_get_contents($state_file), TRUE);
+    return is_array($state) ? $state : [];
+  }
+
+  /**
+   * Writes the saved import progress state.
+   */
+  protected function writeProgressState(string $state_file, int $next_offset, string $label, string $status, ?int $nid = NULL): void {
+    $directory = dirname($state_file);
+    if (!is_dir($directory)) {
+      mkdir($directory, 0775, TRUE);
+    }
+    $state = [
+      'next_offset' => $next_offset,
+      'last_label' => $label,
+      'last_status' => $status,
+      'last_nid' => $nid,
+      'updated_at' => date(DATE_ATOM),
+    ];
+    file_put_contents($state_file, json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+  }
+
+  /**
+   * Clears the saved import progress state.
+   */
+  protected function clearProgressState(string $state_file): void {
+    if (file_exists($state_file)) {
+      unlink($state_file);
     }
   }
 
