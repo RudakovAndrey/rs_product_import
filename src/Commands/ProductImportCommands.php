@@ -3,6 +3,7 @@
 namespace Drupal\rs_product_import\Commands;
 
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Database\DatabaseExceptionWrapper;
 use Drupal\node\Entity\Node;
 use Drupal\taxonomy\TermInterface;
 use Drush\Commands\DrushCommands;
@@ -78,6 +79,8 @@ class ProductImportCommands extends DrushCommands {
    * @option resume Continue from the last saved import progress offset.
    * @option reset-progress Clear saved import progress before running.
    * @option state-file Progress state JSON file path. Defaults to Drupal temporary directory.
+   * @option save-retries Retry node save this many times on database lock timeout.
+   * @option save-retry-sleep Seconds to wait between save retries.
    */
   public function import(array $options = [
     'file' => NULL,
@@ -90,6 +93,8 @@ class ProductImportCommands extends DrushCommands {
     'resume' => FALSE,
     'reset-progress' => FALSE,
     'state-file' => NULL,
+    'save-retries' => 3,
+    'save-retry-sleep' => 5,
   ]): void {
     $state_file = $this->progressStateFile($options);
     if (!empty($options['reset-progress'])) {
@@ -120,6 +125,8 @@ class ProductImportCommands extends DrushCommands {
     $allow_update = (bool) $options['update'];
     $log_every = max(1, (int) ($options['log-every'] ?? 100));
     $stop_after = $options['stop-after'] !== NULL ? max(0, (int) $options['stop-after']) : NULL;
+    $save_retries = max(0, (int) ($options['save-retries'] ?? 3));
+    $save_retry_sleep = max(1, (int) ($options['save-retry-sleep'] ?? 5));
     $processed = 0;
 
     $this->output()->writeln('RS product import started.');
@@ -179,7 +186,7 @@ class ProductImportCommands extends DrushCommands {
 
       if (!$dry_run) {
         $this->output()->writeln("[{$processed}] saving node {$label}");
-        $node->save();
+        $this->saveNodeWithRetries($node, $label, $save_retries, $save_retry_sleep);
         $this->output()->writeln("[{$processed}] saved node nid=" . $node->id() . " {$label}");
         $this->writeProgressState($state_file, $next_offset, $label, $is_new ? 'created' : 'updated', (int) $node->id());
       }
@@ -361,6 +368,37 @@ class ProductImportCommands extends DrushCommands {
       return '';
     }
     return $old_id . '|' . mb_strtoupper($article);
+  }
+
+  /**
+   * Saves a node, retrying transient database lock timeouts.
+   */
+  protected function saveNodeWithRetries(Node $node, string $label, int $retries, int $sleep): void {
+    $attempt = 0;
+    while (TRUE) {
+      try {
+        $node->save();
+        return;
+      }
+      catch (DatabaseExceptionWrapper $exception) {
+        if (!$this->isLockTimeoutException($exception) || $attempt >= $retries) {
+          throw $exception;
+        }
+        $attempt++;
+        $this->output()->writeln("[save retry {$attempt}/{$retries}] database lock timeout for {$label}; sleeping {$sleep}s");
+        sleep($sleep);
+      }
+    }
+  }
+
+  /**
+   * Checks whether an exception is a MySQL lock wait timeout/deadlock.
+   */
+  protected function isLockTimeoutException(DatabaseExceptionWrapper $exception): bool {
+    $message = $exception->getMessage();
+    return strpos($message, '1205 Lock wait timeout') !== FALSE
+      || strpos($message, '1213 Deadlock found') !== FALSE
+      || strpos($message, 'Lock wait timeout exceeded') !== FALSE;
   }
 
   /**
