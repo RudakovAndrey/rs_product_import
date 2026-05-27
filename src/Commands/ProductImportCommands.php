@@ -287,13 +287,15 @@ class ProductImportCommands extends DrushCommands {
    * @command rs-product-import:duplicate-diff
    * @aliases rspidd
    * @option cat-number Check only this catalog number.
-   * @option limit Maximum number of duplicate catalog numbers to print.
+   * @option limit Maximum number of duplicate catalog numbers to print. Use 0 for all.
    * @option fields Comma-separated fields to compare, or all. Defaults to key product fields.
+   * @option output Write the report to this file path instead of the terminal.
    */
   public function duplicateDiff(array $options = [
     'cat-number' => NULL,
     'limit' => 50,
     'fields' => NULL,
+    'output' => NULL,
   ]): void {
     $groups = $this->loadDuplicateCatalogNumberGroups($options);
     if (!$groups) {
@@ -302,7 +304,8 @@ class ProductImportCommands extends DrushCommands {
     }
 
     $storage = $this->entityTypeManager->getStorage('node');
-    $this->output()->writeln('Duplicate catalog numbers: ' . count($groups));
+    $lines = [];
+    $lines[] = 'Duplicate catalog numbers: ' . count($groups);
 
     foreach ($groups as $cat_number => $nids) {
       /** @var \Drupal\node\Entity\Node[] $nodes */
@@ -310,27 +313,29 @@ class ProductImportCommands extends DrushCommands {
       $fields = $this->duplicateDiffFields($nodes, (string) ($options['fields'] ?? ''));
       $differences = $this->nodeFieldDifferences($nodes, $fields);
 
-      $this->output()->writeln('');
-      $this->output()->writeln("Catalog number: {$cat_number}");
-      $this->output()->writeln('NIDs: ' . implode(', ', array_keys($nodes)));
+      $lines[] = '';
+      $lines[] = "Catalog number: {$cat_number}";
+      $lines[] = 'NIDs: ' . implode(', ', array_keys($nodes));
       foreach ($nodes as $node) {
         $old_id = $node->hasField('field_old_id') && !$node->get('field_old_id')->isEmpty() ? $node->get('field_old_id')->value : '';
-        $this->output()->writeln('  nid=' . $node->id() . ' old_id=' . $old_id . ' title="' . $node->label() . '"');
+        $lines[] = '  nid=' . $node->id() . ' old_id=' . $old_id . ' title="' . $node->label() . '"';
       }
 
       if (!$differences) {
-        $this->output()->writeln('  No differences in compared fields.');
+        $lines[] = '  No differences in compared fields.';
         continue;
       }
 
-      $this->output()->writeln('  Differences:');
+      $lines[] = '  Differences:';
       foreach ($differences as $field_name => $values) {
-        $this->output()->writeln("  - {$field_name}:");
+        $lines[] = "  - {$field_name}:";
         foreach ($values as $nid => $value) {
-          $this->output()->writeln('      nid=' . $nid . ': ' . $value);
+          $lines[] = '      nid=' . $nid . ': ' . $value;
         }
       }
     }
+
+    $this->writeDuplicateDiffReport($lines, (string) ($options['output'] ?? ''));
   }
 
   /**
@@ -486,8 +491,9 @@ class ProductImportCommands extends DrushCommands {
     $query->having('COUNT(n.nid) > 1');
     $query->orderBy('qty', 'DESC');
     $query->orderBy('cat_number', 'ASC');
-    if (empty($options['cat-number'])) {
-      $query->range(0, max(1, (int) ($options['limit'] ?? 50)));
+    $limit = (int) ($options['limit'] ?? 50);
+    if (empty($options['cat-number']) && $limit > 0) {
+      $query->range(0, $limit);
     }
 
     $groups = [];
@@ -502,6 +508,24 @@ class ProductImportCommands extends DrushCommands {
       $groups[$cat_number] = array_map('intval', $nid_query->execute()->fetchCol());
     }
     return $groups;
+  }
+
+  /**
+   * Writes a duplicate diff report to output or to a file.
+   */
+  protected function writeDuplicateDiffReport(array $lines, string $output): void {
+    $report = implode(PHP_EOL, $lines) . PHP_EOL;
+    if ($output === '') {
+      $this->output()->write($report);
+      return;
+    }
+
+    $directory = dirname($output);
+    if ($directory !== '.' && !is_dir($directory)) {
+      mkdir($directory, 0775, TRUE);
+    }
+    file_put_contents($output, $report);
+    $this->output()->writeln("Duplicate diff report written: {$output}");
   }
 
   /**
