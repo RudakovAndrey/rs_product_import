@@ -86,6 +86,7 @@ class ProductImportCommands extends DrushCommands {
    * @option import-images Download and attach product images from the images array.
    * @option image-directory Public/private stream wrapper directory for downloaded images.
    * @option image-timeout HTTP timeout in seconds for each image.
+   * @option source Import only products from this source, for example urc_ymz.
    */
   public function import(array $options = [
     'file' => NULL,
@@ -103,6 +104,7 @@ class ProductImportCommands extends DrushCommands {
     'import-images' => TRUE,
     'image-directory' => 'public://imported-products',
     'image-timeout' => 15,
+    'source' => NULL,
   ]): void {
     $state_file = $this->progressStateFile($options);
     if (!empty($options['reset-progress'])) {
@@ -143,6 +145,9 @@ class ProductImportCommands extends DrushCommands {
     $this->output()->writeln('RS product import started.');
     $this->output()->writeln('Base offset: ' . $base_offset);
     $this->output()->writeln('Products selected: ' . count($products));
+    if (!empty($options['source'])) {
+      $this->output()->writeln('Source filter: ' . (string) $options['source']);
+    }
     $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
     $this->output()->writeln('Import images: ' . ($import_images ? 'yes' : 'no'));
     $this->output()->writeln('Progress state file: ' . $state_file);
@@ -220,11 +225,13 @@ class ProductImportCommands extends DrushCommands {
    * @option file JSON file path. Defaults to module data/products.json.
    * @option limit Maximum number of products to check.
    * @option offset Number of products to skip from the beginning.
+   * @option source Check only products from this source, for example urc_ymz.
    */
   public function status(array $options = [
     'file' => NULL,
     'limit' => NULL,
     'offset' => 0,
+    'source' => NULL,
   ]): void {
     $products = $this->loadProducts($options);
     $storage = $this->entityTypeManager->getStorage('node');
@@ -396,6 +403,11 @@ class ProductImportCommands extends DrushCommands {
     $items = json_decode(file_get_contents($file), TRUE);
     if (!is_array($items)) {
       throw new \RuntimeException("Cannot decode JSON file: {$file}");
+    }
+
+    if (!empty($options['source'])) {
+      $source = (string) $options['source'];
+      $items = array_values(array_filter($items, static fn(array $item): bool => ($item['source'] ?? '') === $source));
     }
 
     $offset = max(0, (int) ($options['offset'] ?? 0));
@@ -912,7 +924,11 @@ class ProductImportCommands extends DrushCommands {
     if (!$temporary) {
       $temporary = sys_get_temp_dir();
     }
-    return rtrim($temporary, '/\\') . DIRECTORY_SEPARATOR . 'rs_product_import_progress.json';
+    $suffix = '';
+    if (!empty($options['source'])) {
+      $suffix = '_' . preg_replace('/[^a-z0-9_-]+/i', '_', (string) $options['source']);
+    }
+    return rtrim($temporary, '/\\') . DIRECTORY_SEPARATOR . "rs_product_import_progress{$suffix}.json";
   }
 
   /**
