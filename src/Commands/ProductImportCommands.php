@@ -4,6 +4,7 @@ namespace Drupal\rs_product_import\Commands;
 
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Database\DatabaseExceptionWrapper;
+use Drupal\file\Entity\File;
 use Drupal\node\Entity\Node;
 use Drupal\taxonomy\Entity\Term;
 use Drupal\taxonomy\TermInterface;
@@ -82,6 +83,9 @@ class ProductImportCommands extends DrushCommands {
    * @option state-file Progress state JSON file path. Defaults to Drupal temporary directory.
    * @option save-retries Retry node save this many times on database lock timeout.
    * @option save-retry-sleep Seconds to wait between save retries.
+   * @option import-images Download and attach product images from the images array.
+   * @option image-directory Public/private stream wrapper directory for downloaded images.
+   * @option image-timeout HTTP timeout in seconds for each image.
    */
   public function import(array $options = [
     'file' => NULL,
@@ -96,6 +100,9 @@ class ProductImportCommands extends DrushCommands {
     'state-file' => NULL,
     'save-retries' => 3,
     'save-retry-sleep' => 5,
+    'import-images' => TRUE,
+    'image-directory' => 'public://imported-products',
+    'image-timeout' => 15,
   ]): void {
     $state_file = $this->progressStateFile($options);
     if (!empty($options['reset-progress'])) {
@@ -128,12 +135,16 @@ class ProductImportCommands extends DrushCommands {
     $stop_after = $options['stop-after'] !== NULL ? max(0, (int) $options['stop-after']) : NULL;
     $save_retries = max(0, (int) ($options['save-retries'] ?? 3));
     $save_retry_sleep = max(1, (int) ($options['save-retry-sleep'] ?? 5));
+    $import_images = (bool) $options['import-images'];
+    $image_directory = (string) ($options['image-directory'] ?? 'public://imported-products');
+    $image_timeout = max(1, (int) ($options['image-timeout'] ?? 15));
     $processed = 0;
 
     $this->output()->writeln('RS product import started.');
     $this->output()->writeln('Base offset: ' . $base_offset);
     $this->output()->writeln('Products selected: ' . count($products));
     $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
+    $this->output()->writeln('Import images: ' . ($import_images ? 'yes' : 'no'));
     $this->output()->writeln('Progress state file: ' . $state_file);
 
     foreach ($products as $index => $product) {
@@ -183,7 +194,7 @@ class ProductImportCommands extends DrushCommands {
       }
 
       $this->output()->writeln("[{$processed}] filling node fields {$label}; categories=" . count($category_ids));
-      $this->fillProductNode($node, $product, $category_ids);
+      $this->fillProductNode($node, $product, $category_ids, $import_images, $image_directory, $image_timeout, $label);
 
       if (!$dry_run) {
         $this->output()->writeln("[{$processed}] saving node {$label}");
@@ -550,7 +561,7 @@ class ProductImportCommands extends DrushCommands {
   /**
    * Fills product node fields from a normalized product row.
    */
-  protected function fillProductNode(Node $node, array $product, array $category_ids): void {
+  protected function fillProductNode(Node $node, array $product, array $category_ids, bool $import_images, string $image_directory, int $image_timeout, string $label): void {
     $title = (string) $product['title'];
     $node->setTitle($title);
     $this->setIfFieldExists($node, 'status', (int) ($product['status'] ?? 1));
@@ -609,6 +620,9 @@ class ProductImportCommands extends DrushCommands {
     $this->setIfFieldExists($node, 'default_qty', 1);
     $this->setIfFieldExists($node, 'field_weight_for_sort', (int) round((float) ($product['weight'] ?? 0) * 1000));
     $this->setIfFieldExists($node, 'field_is_exist_img', !empty($product['images']) ? 1 : 0);
+    if ($import_images && $node->hasField('uc_product_image') && !empty($product['images'])) {
+      $this->attachProductImages($node, $product, $image_directory, $image_timeout, $label);
+    }
   }
 
   /**
@@ -740,6 +754,108 @@ class ProductImportCommands extends DrushCommands {
 
   protected function formatDecimal(float $value): string {
     return number_format($value, 5, '.', '');
+  }
+
+  /**
+   * Downloads and attaches product images if the field is still empty.
+   */
+  protected function attachProductImages(Node $node, array $product, string $directory, int $timeout, string $label): void {
+    if (!$node->get('uc_product_image')->isEmpty()) {
+      return;
+    }
+
+    $file_system = \Drupal::service('file_system');
+    $file_system->prepareDirectory($directory, \Drupal\Core\File\FileSystemInterface::CREATE_DIRECTORY | \Drupal\Core\File\FileSystemInterface::MODIFY_PERMISSIONS);
+
+    $values = [];
+    $title = (string) ($product['title'] ?? $node->label());
+    foreach (($product['images'] ?? []) as $delta => $url) {
+      $url = trim((string) $url);
+      if ($url === '') {
+        continue;
+      }
+      $file = $this->downloadProductImage($url, $directory, $product, $delta, $timeout, $label);
+      if (!$file) {
+        continue;
+      }
+      $values[] = [
+        'target_id' => $file->id(),
+        'alt' => $title,
+        'title' => $title,
+      ];
+    }
+
+    if ($values) {
+      $node->set('uc_product_image', $values);
+      $this->setIfFieldExists($node, 'field_is_exist_img', 1);
+    }
+  }
+
+  /**
+   * Downloads a single product image and returns a managed file entity.
+   */
+  protected function downloadProductImage(string $url, string $directory, array $product, int $delta, int $timeout, string $label): ?File {
+    $uri = $this->productImageUri($url, $directory, $product, $delta);
+    $existing = $this->loadFileByUri($uri);
+    if ($existing) {
+      return $existing;
+    }
+
+    try {
+      $response = \Drupal::httpClient()->get($url, [
+        'timeout' => $timeout,
+        'http_errors' => FALSE,
+        'headers' => [
+          'User-Agent' => 'RS Product Import/1.0',
+        ],
+      ]);
+      if ($response->getStatusCode() >= 400) {
+        $this->output()->writeln('[image skipped] HTTP ' . $response->getStatusCode() . " {$url} {$label}");
+        return NULL;
+      }
+      $data = (string) $response->getBody();
+      if ($data === '') {
+        $this->output()->writeln("[image skipped] empty response {$url} {$label}");
+        return NULL;
+      }
+      file_put_contents($uri, $data);
+    }
+    catch (\Throwable $exception) {
+      $this->output()->writeln('[image skipped] ' . $exception->getMessage() . " {$url} {$label}");
+      return NULL;
+    }
+
+    $file = File::create([
+      'uri' => $uri,
+      'status' => 1,
+      'uid' => 0,
+    ]);
+    $file->setPermanent();
+    $file->save();
+    return $file;
+  }
+
+  /**
+   * Builds a stable destination URI for a product image.
+   */
+  protected function productImageUri(string $url, string $directory, array $product, int $delta): string {
+    $path = (string) parse_url($url, PHP_URL_PATH);
+    $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    if (!in_array($extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'], TRUE)) {
+      $extension = 'jpg';
+    }
+    $source = preg_replace('/[^a-z0-9_-]+/i', '_', (string) ($product['source'] ?? 'source'));
+    $source_id = preg_replace('/[^a-z0-9_-]+/i', '_', (string) ($product['source_id'] ?? '0'));
+    $hash = substr(sha1($url), 0, 12);
+    return rtrim($directory, '/\\') . '/' . $source . '-' . $source_id . '-' . $delta . '-' . $hash . '.' . $extension;
+  }
+
+  /**
+   * Loads a managed file entity by URI.
+   */
+  protected function loadFileByUri(string $uri): ?File {
+    $files = \Drupal::entityTypeManager()->getStorage('file')->loadByProperties(['uri' => $uri]);
+    return $files ? reset($files) : NULL;
   }
 
   protected function printImportSummary(int $processed, int $created, int $updated, int $skipped, int $missing_categories, bool $dry_run): void {
