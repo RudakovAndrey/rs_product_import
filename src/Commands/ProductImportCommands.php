@@ -610,7 +610,7 @@ class ProductImportCommands extends DrushCommands {
 
     $price = $this->formatDecimal((float) ($product['price'] ?? 0));
     $weight = $this->formatDecimal((float) ($product['weight'] ?? 0));
-    $this->setIfFieldExists($node, 'model', (string) ($product['article'] ?: ($product['import_key'] ?? '0')));
+    $this->setIfFieldExists($node, 'model', $this->productModelValue($product));
     $this->setIfFieldExists($node, 'cost', ['value' => '0.00000']);
     $this->setIfFieldExists($node, 'price', ['value' => $price]);
     $this->setIfFieldExists($node, 'shippable', 1);
@@ -623,6 +623,25 @@ class ProductImportCommands extends DrushCommands {
     if ($import_images && $node->hasField('uc_product_image') && !empty($product['images'])) {
       $this->attachProductImages($node, $product, $image_directory, $image_timeout, $label);
     }
+  }
+
+  /**
+   * Returns a short value for the Ubercart model/SKU column.
+   */
+  protected function productModelValue(array $product): string {
+    $article = trim(preg_replace('/\s+/u', ' ', (string) ($product['article'] ?? '')) ?? '');
+    if ($article !== '' && mb_strlen($article) <= 32) {
+      return $article;
+    }
+
+    $fallback = trim((string) ($product['import_key'] ?? ''));
+    if ($fallback === '') {
+      $source = trim((string) ($product['source'] ?? 'product'));
+      $source_id = trim((string) ($product['source_id'] ?? '0'));
+      $fallback = "{$source}:{$source_id}";
+    }
+
+    return mb_substr($fallback, 0, 32);
   }
 
   /**
