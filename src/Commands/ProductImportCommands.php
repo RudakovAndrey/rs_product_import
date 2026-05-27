@@ -59,6 +59,8 @@ class ProductImportCommands extends DrushCommands {
    * @option offset Number of products to skip from the beginning.
    * @option update Update existing nodes found by old ID and catalog number.
    * @option dry-run Validate and print counters without saving nodes.
+   * @option log-every Print progress every N products.
+   * @option stop-after Stop after processing N products in this run.
    */
   public function import(array $options = [
     'file' => NULL,
@@ -66,6 +68,8 @@ class ProductImportCommands extends DrushCommands {
     'offset' => 0,
     'update' => TRUE,
     'dry-run' => FALSE,
+    'log-every' => 100,
+    'stop-after' => NULL,
   ]): void {
     $products = $this->loadProducts($options);
     $this->buildTermLookup();
@@ -76,15 +80,36 @@ class ProductImportCommands extends DrushCommands {
     $missing_categories = 0;
     $dry_run = (bool) $options['dry-run'];
     $allow_update = (bool) $options['update'];
+    $log_every = max(1, (int) ($options['log-every'] ?? 100));
+    $stop_after = $options['stop-after'] !== NULL ? max(0, (int) $options['stop-after']) : NULL;
+    $processed = 0;
 
-    foreach ($products as $product) {
+    $this->output()->writeln('RS product import started.');
+    $this->output()->writeln('Products selected: ' . count($products));
+    $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
+
+    foreach ($products as $index => $product) {
+      if ($stop_after !== NULL && $processed >= $stop_after) {
+        $this->output()->writeln("Stopped by --stop-after={$stop_after}.");
+        break;
+      }
+
+      $processed++;
+      $label = $this->productDebugLabel($product, $index);
+      if ($processed === 1 || $processed % $log_every === 0) {
+        $this->output()->writeln("[{$processed}/" . count($products) . "] processing {$label}");
+      }
+
       if (empty($product['title']) || empty($product['source']) || empty($product['source_id'])) {
+        $this->output()->writeln("[{$processed}] skipped invalid product {$label}");
         $skipped++;
         continue;
       }
 
+      $this->output()->writeln("[{$processed}] loading existing node {$label}");
       $node = $this->loadExistingProduct($product);
       if ($node && !$allow_update) {
+        $this->output()->writeln("[{$processed}] skipped existing node nid=" . $node->id() . " {$label}");
         $skipped++;
         continue;
       }
@@ -99,21 +124,28 @@ class ProductImportCommands extends DrushCommands {
         ]);
       }
 
+      $this->output()->writeln("[{$processed}] resolving categories {$label}");
       $category_ids = $this->resolveCategoryTargetIds($product);
       if (!$category_ids && !empty($product['canonical_category_old_ids'])) {
         $missing_categories++;
       }
 
+      $this->output()->writeln("[{$processed}] filling node fields {$label}; categories=" . count($category_ids));
       $this->fillProductNode($node, $product, $category_ids);
 
       if (!$dry_run) {
+        $this->output()->writeln("[{$processed}] saving node {$label}");
         $node->save();
+        $this->output()->writeln("[{$processed}] saved node nid=" . $node->id() . " {$label}");
+      }
+      else {
+        $this->output()->writeln("[{$processed}] dry-run passed {$label}");
       }
 
       $is_new ? $created++ : $updated++;
     }
 
-    $this->printImportSummary(count($products), $created, $updated, $skipped, $missing_categories, $dry_run);
+    $this->printImportSummary($processed, $created, $updated, $skipped, $missing_categories, $dry_run);
   }
 
   /**
@@ -440,6 +472,18 @@ class ProductImportCommands extends DrushCommands {
     foreach ($items as $item) {
       $this->output()->writeln('- ' . $item);
     }
+  }
+
+  /**
+   * Builds a compact label for progress/debug output.
+   */
+  protected function productDebugLabel(array $product, int $index): string {
+    $source = $product['source'] ?? '?';
+    $source_id = $product['source_id'] ?? '?';
+    $article = $product['article'] ?? '';
+    $title = $product['title'] ?? '';
+    $title = mb_substr((string) $title, 0, 80);
+    return "#{$index} {$source}:{$source_id} article={$article} title=\"{$title}\"";
   }
 
 }
