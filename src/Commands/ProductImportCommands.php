@@ -366,8 +366,9 @@ class ProductImportCommands extends DrushCommands {
     foreach ($groups as $group) {
       /** @var \Drupal\node\Entity\Node[] $nodes */
       $nodes = $storage->loadMultiple($group['nids']);
-      $differences = $this->nodeFieldDifferences($nodes, $this->exactDuplicateCompareFields());
-      if ($differences) {
+      $duplicate_sets = $this->exactDuplicateNodeSets($nodes);
+      if (!$duplicate_sets) {
+        $differences = $this->nodeFieldDifferences($nodes, $this->exactDuplicateCompareFields());
         $skipped++;
         $lines[] = '';
         $lines[] = 'Skipped changed group old_id=' . $group['old_id'] . ' cat_number=' . $group['cat_number'] . ' nids=' . implode(',', $group['nids']);
@@ -375,19 +376,21 @@ class ProductImportCommands extends DrushCommands {
         continue;
       }
 
-      $keep_nid = min(array_keys($nodes));
-      $delete_nids = array_values(array_diff(array_keys($nodes), [$keep_nid]));
-      $kept++;
-      $deleted += count($delete_nids);
-
       $lines[] = '';
       $lines[] = 'Duplicate group old_id=' . $group['old_id'] . ' cat_number=' . $group['cat_number'];
-      $lines[] = 'Keep nid=' . $keep_nid . '; delete nids=' . implode(',', $delete_nids);
+      foreach ($duplicate_sets as $set_nids) {
+        $keep_nid = min($set_nids);
+        $delete_nids = array_values(array_diff($set_nids, [$keep_nid]));
+        $kept++;
+        $deleted += count($delete_nids);
 
-      if (!$dry_run) {
-        foreach ($delete_nids as $nid) {
-          if (isset($nodes[$nid])) {
-            $nodes[$nid]->delete();
+        $lines[] = 'Keep nid=' . $keep_nid . '; delete nids=' . implode(',', $delete_nids);
+
+        if (!$dry_run) {
+          foreach ($delete_nids as $nid) {
+            if (isset($nodes[$nid])) {
+              $nodes[$nid]->delete();
+            }
           }
         }
       }
@@ -649,6 +652,23 @@ class ProductImportCommands extends DrushCommands {
       'uc_product_image',
       'field_is_exist_img',
     ];
+  }
+
+  /**
+   * Finds identical node subsets inside one old ID/catalog number group.
+   */
+  protected function exactDuplicateNodeSets(array $nodes): array {
+    $sets = [];
+    foreach ($nodes as $node) {
+      $values = [];
+      foreach ($this->exactDuplicateCompareFields() as $field_name) {
+        $values[$field_name] = $this->nodeCompareValue($node, $field_name);
+      }
+      $signature = sha1(json_encode($values, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+      $sets[$signature][] = (int) $node->id();
+    }
+
+    return array_values(array_filter($sets, static fn(array $nids): bool => count($nids) > 1));
   }
 
   /**
