@@ -282,6 +282,58 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
+   * Prints field differences between product nodes with equal catalog numbers.
+   *
+   * @command rs-product-import:duplicate-diff
+   * @aliases rspidd
+   * @option cat-number Check only this catalog number.
+   * @option limit Maximum number of duplicate catalog numbers to print.
+   * @option fields Comma-separated fields to compare, or all. Defaults to key product fields.
+   */
+  public function duplicateDiff(array $options = [
+    'cat-number' => NULL,
+    'limit' => 50,
+    'fields' => NULL,
+  ]): void {
+    $groups = $this->loadDuplicateCatalogNumberGroups($options);
+    if (!$groups) {
+      $this->output()->writeln('No duplicate product catalog numbers found.');
+      return;
+    }
+
+    $storage = $this->entityTypeManager->getStorage('node');
+    $this->output()->writeln('Duplicate catalog numbers: ' . count($groups));
+
+    foreach ($groups as $cat_number => $nids) {
+      /** @var \Drupal\node\Entity\Node[] $nodes */
+      $nodes = $storage->loadMultiple($nids);
+      $fields = $this->duplicateDiffFields($nodes, (string) ($options['fields'] ?? ''));
+      $differences = $this->nodeFieldDifferences($nodes, $fields);
+
+      $this->output()->writeln('');
+      $this->output()->writeln("Catalog number: {$cat_number}");
+      $this->output()->writeln('NIDs: ' . implode(', ', array_keys($nodes)));
+      foreach ($nodes as $node) {
+        $old_id = $node->hasField('field_old_id') && !$node->get('field_old_id')->isEmpty() ? $node->get('field_old_id')->value : '';
+        $this->output()->writeln('  nid=' . $node->id() . ' old_id=' . $old_id . ' title="' . $node->label() . '"');
+      }
+
+      if (!$differences) {
+        $this->output()->writeln('  No differences in compared fields.');
+        continue;
+      }
+
+      $this->output()->writeln('  Differences:');
+      foreach ($differences as $field_name => $values) {
+        $this->output()->writeln("  - {$field_name}:");
+        foreach ($values as $nid => $value) {
+          $this->output()->writeln('      nid=' . $nid . ': ' . $value);
+        }
+      }
+    }
+  }
+
+  /**
    * Imports original CKT and URC taxonomy trees without restructuring.
    *
    * @command rs-product-import:import-taxonomy
@@ -413,6 +465,133 @@ class ProductImportCommands extends DrushCommands {
     $offset = max(0, (int) ($options['offset'] ?? 0));
     $limit = $options['limit'] !== NULL ? max(0, (int) $options['limit']) : NULL;
     return ($offset || $limit !== NULL) ? array_slice($items, $offset, $limit) : $items;
+  }
+
+  /**
+   * Loads duplicate product catalog number groups.
+   */
+  protected function loadDuplicateCatalogNumberGroups(array $options): array {
+    $database = \Drupal::database();
+    $query = $database->select('node_field_data', 'n');
+    $query->innerJoin('node__field_cat_number', 'cat', 'cat.entity_id = n.nid AND cat.deleted = 0');
+    $query->addField('cat', 'field_cat_number_value', 'cat_number');
+    $query->addExpression('COUNT(n.nid)', 'qty');
+    $query->condition('n.type', 'product');
+    $query->isNotNull('cat.field_cat_number_value');
+    $query->condition('cat.field_cat_number_value', '', '<>');
+    if (!empty($options['cat-number'])) {
+      $query->condition('cat.field_cat_number_value', (string) $options['cat-number']);
+    }
+    $query->groupBy('cat.field_cat_number_value');
+    $query->having('COUNT(n.nid) > 1');
+    $query->orderBy('qty', 'DESC');
+    $query->orderBy('cat_number', 'ASC');
+    if (empty($options['cat-number'])) {
+      $query->range(0, max(1, (int) ($options['limit'] ?? 50)));
+    }
+
+    $groups = [];
+    foreach ($query->execute() as $row) {
+      $cat_number = (string) $row->cat_number;
+      $nid_query = $database->select('node_field_data', 'n');
+      $nid_query->innerJoin('node__field_cat_number', 'cat', 'cat.entity_id = n.nid AND cat.deleted = 0');
+      $nid_query->fields('n', ['nid']);
+      $nid_query->condition('n.type', 'product');
+      $nid_query->condition('cat.field_cat_number_value', $cat_number);
+      $nid_query->orderBy('n.nid', 'ASC');
+      $groups[$cat_number] = array_map('intval', $nid_query->execute()->fetchCol());
+    }
+    return $groups;
+  }
+
+  /**
+   * Returns field names to compare for duplicate products.
+   */
+  protected function duplicateDiffFields(array $nodes, string $fields_option): array {
+    if ($fields_option === 'all') {
+      $fields = [];
+      foreach ($nodes as $node) {
+        foreach ($node->getFieldDefinitions() as $field_name => $definition) {
+          if (!$definition->isComputed()) {
+            $fields[$field_name] = $field_name;
+          }
+        }
+      }
+      return array_values($fields);
+    }
+
+    if ($fields_option !== '') {
+      return array_filter(array_map('trim', explode(',', $fields_option)));
+    }
+
+    return [
+      'title',
+      'status',
+      'field_old_id',
+      'field_title',
+      'field_display_title',
+      'field_brand',
+      'field_stock_available',
+      'field_not_for_sale',
+      'field_catalog',
+      'body',
+      'field_parameters',
+      'field_applicability',
+      'field_models_applicability',
+      'field_marks',
+      'model',
+      'price',
+      'cost',
+      'weight',
+      'dimensions',
+      'uc_product_image',
+      'field_is_exist_img',
+    ];
+  }
+
+  /**
+   * Builds a map of changed field values for a set of nodes.
+   */
+  protected function nodeFieldDifferences(array $nodes, array $fields): array {
+    $differences = [];
+    foreach ($fields as $field_name) {
+      $values = [];
+      foreach ($nodes as $node) {
+        $values[(int) $node->id()] = $this->nodeCompareValue($node, $field_name);
+      }
+      if (count(array_unique($values)) > 1) {
+        $differences[$field_name] = $values;
+      }
+    }
+    return $differences;
+  }
+
+  /**
+   * Normalizes a node field value for readable comparison.
+   */
+  protected function nodeCompareValue(Node $node, string $field_name): string {
+    if ($field_name === 'title') {
+      return $this->shortValue($node->label());
+    }
+    if ($field_name === 'status') {
+      return $node->isPublished() ? '1' : '0';
+    }
+    if (!$node->hasField($field_name)) {
+      return '[field missing]';
+    }
+    if ($node->get($field_name)->isEmpty()) {
+      return '[empty]';
+    }
+    $value = $node->get($field_name)->getValue();
+    return $this->shortValue(json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+  }
+
+  /**
+   * Shortens long values for terminal output.
+   */
+  protected function shortValue(string $value): string {
+    $value = preg_replace('/\s+/u', ' ', $value) ?? $value;
+    return mb_strlen($value) > 500 ? mb_substr($value, 0, 500) . '...' : $value;
   }
 
   /**
