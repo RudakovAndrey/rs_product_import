@@ -33,6 +33,18 @@ drush rs-product-import:import --file=/absolute/path/products.json
 
 ## Import
 
+Import original taxonomy trees:
+
+```bash
+drush rs-product-import:import-taxonomy
+```
+
+Test taxonomy import without saving:
+
+```bash
+drush rs-product-import:import-taxonomy --dry-run
+```
+
 Test without saving:
 
 ```bash

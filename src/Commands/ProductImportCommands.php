@@ -5,6 +5,7 @@ namespace Drupal\rs_product_import\Commands;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Database\DatabaseExceptionWrapper;
 use Drupal\node\Entity\Node;
+use Drupal\taxonomy\Entity\Term;
 use Drupal\taxonomy\TermInterface;
 use Drush\Commands\DrushCommands;
 
@@ -263,23 +264,132 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
+   * Imports original CKT and URC taxonomy trees without restructuring.
+   *
+   * @command rs-product-import:import-taxonomy
+   * @aliases rspit
+   * @option file JSON file path. Defaults to module data/taxonomy_terms_original.json.
+   * @option limit Maximum number of terms to process.
+   * @option offset Number of terms to skip from the beginning.
+   * @option update Update existing terms found by old ID, name, and parent.
+   * @option dry-run Validate and print counters without saving terms.
+   * @option log-every Print progress every N terms.
+   */
+  public function importTaxonomy(array $options = [
+    'file' => NULL,
+    'limit' => NULL,
+    'offset' => 0,
+    'update' => TRUE,
+    'dry-run' => FALSE,
+    'log-every' => 100,
+  ]): void {
+    $items = $this->loadJsonItems($options, 'taxonomy_terms_original.json');
+    $term_map = [];
+    $created = 0;
+    $updated = 0;
+    $skipped = 0;
+    $missing_parents = 0;
+    $dry_run = (bool) $options['dry-run'];
+    $allow_update = (bool) $options['update'];
+    $log_every = max(1, (int) ($options['log-every'] ?? 100));
+    $storage = $this->entityTypeManager->getStorage('taxonomy_term');
+
+    $this->output()->writeln('RS taxonomy import started.');
+    $this->output()->writeln('Terms selected: ' . count($items));
+    $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
+
+    foreach ($items as $index => $item) {
+      $source = (string) ($item['source'] ?? '');
+      $old_tid = (string) ($item['old_tid'] ?? '');
+      $parent_old_tid = (string) ($item['parent_old_tid'] ?? '0');
+      $name = trim((string) ($item['name'] ?? ''));
+      $label = "#{$index} {$source}:{$old_tid} {$name}";
+
+      if ($index === 0 || ($index + 1) % $log_every === 0) {
+        $this->output()->writeln('[' . ($index + 1) . '/' . count($items) . "] processing {$label}");
+      }
+
+      if ($source === '' || $old_tid === '' || $name === '') {
+        $skipped++;
+        $this->output()->writeln("skipped invalid term {$label}");
+        continue;
+      }
+
+      $parent_target_id = 0;
+      if ($parent_old_tid !== '' && $parent_old_tid !== '0') {
+        $parent_key = "{$source}:{$parent_old_tid}";
+        if (empty($term_map[$parent_key])) {
+          $missing_parents++;
+          $skipped++;
+          $this->output()->writeln("missing parent {$parent_key}; skipped {$label}");
+          continue;
+        }
+        $parent_target_id = $term_map[$parent_key];
+      }
+
+      $existing_tid = $this->findExistingCatalogTerm($name, $parent_target_id, $old_tid);
+      if ($existing_tid && !$allow_update) {
+        $term_map["{$source}:{$old_tid}"] = $existing_tid;
+        $skipped++;
+        continue;
+      }
+
+      /** @var \Drupal\taxonomy\TermInterface $term */
+      $term = $existing_tid ? $storage->load($existing_tid) : Term::create([
+        'vid' => 'catalog',
+        'langcode' => (string) ($item['langcode'] ?? 'ru'),
+      ]);
+
+      $this->fillCatalogTerm($term, $item, $parent_target_id);
+
+      if (!$dry_run) {
+        $term->save();
+        $term_map["{$source}:{$old_tid}"] = (int) $term->id();
+      }
+      else {
+        $term_map["{$source}:{$old_tid}"] = $existing_tid ?: -($index + 1);
+      }
+
+      $existing_tid ? $updated++ : $created++;
+    }
+
+    $this->output()->writeln('');
+    $this->output()->writeln('RS taxonomy import finished.');
+    $this->output()->writeln('Terms processed: ' . count($items));
+    $this->output()->writeln("Created: {$created}");
+    $this->output()->writeln("Updated: {$updated}");
+    $this->output()->writeln("Skipped: {$skipped}");
+    $this->output()->writeln("Missing parents: {$missing_parents}");
+    if ($dry_run) {
+      $this->output()->writeln('Dry run: no terms were saved.');
+    }
+  }
+
+  /**
    * Loads and slices product data.
    */
   protected function loadProducts(array $options): array {
+    return $this->loadJsonItems($options, 'products.json');
+  }
+
+  /**
+   * Loads and slices a module data JSON file.
+   */
+  protected function loadJsonItems(array $options, string $default_file): array {
     $module_path = \Drupal::service('extension.list.module')->getPath('rs_product_import');
-    $file = $options['file'] ?: DRUPAL_ROOT . '/' . $module_path . '/data/products.json';
+    $file = $options['file'] ?: DRUPAL_ROOT . '/' . $module_path . '/data/' . $default_file;
     if (!file_exists($file)) {
-      throw new \RuntimeException("Products JSON not found: {$file}");
+      throw new \RuntimeException("JSON file not found: {$file}");
     }
 
-    $products = json_decode(file_get_contents($file), TRUE);
-    if (!is_array($products)) {
-      throw new \RuntimeException("Cannot decode products JSON: {$file}");
+    $items = json_decode(file_get_contents($file), TRUE);
+    if (!is_array($items)) {
+      throw new \RuntimeException("Cannot decode JSON file: {$file}");
     }
 
     $offset = max(0, (int) ($options['offset'] ?? 0));
     $limit = $options['limit'] !== NULL ? max(0, (int) $options['limit']) : NULL;
-    return ($offset || $limit !== NULL) ? array_slice($products, $offset, $limit) : $products;
+    return ($offset || $limit !== NULL) ? array_slice($items, $offset, $limit) : $items;
   }
 
   /**
@@ -300,6 +410,42 @@ class ProductImportCommands extends DrushCommands {
       }
       $old_id = (string) $term->get('field_old_id')->value;
       $this->termsByOldId[$old_id][] = $term;
+    }
+  }
+
+  /**
+   * Finds an existing catalog term by exact old ID, name, and parent.
+   */
+  protected function findExistingCatalogTerm(string $name, int $parent_target_id, string $old_tid): ?int {
+    $terms = $this->entityTypeManager->getStorage('taxonomy_term')->loadByProperties([
+      'vid' => 'catalog',
+      'name' => $name,
+      'field_old_id' => (int) $old_tid,
+      'parent' => $parent_target_id,
+    ]);
+    return count($terms) === 1 ? (int) reset($terms)->id() : NULL;
+  }
+
+  /**
+   * Fills catalog taxonomy term fields for the legacy tree import.
+   */
+  protected function fillCatalogTerm(TermInterface $term, array $item, int $parent_target_id): void {
+    $term->setName((string) $item['name']);
+    $term->set('parent', ['target_id' => $parent_target_id]);
+    $term->set('weight', (int) ($item['weight'] ?? 0));
+    $term->set('status', (int) ($item['status'] ?? 1));
+    $this->setIfTermFieldExists($term, 'field_old_id', (int) ($item['old_tid'] ?? 0));
+    $this->setIfTermFieldExists($term, 'field_product_view_type', 'table');
+    $this->setIfTermFieldExists($term, 'field_show_products', 'term_tree');
+    $this->setIfTermFieldExists($term, 'field_subterm_view_type', 'tile_mini');
+  }
+
+  /**
+   * Sets a taxonomy term field only if it exists.
+   */
+  protected function setIfTermFieldExists(TermInterface $term, string $field_name, $value): void {
+    if ($term->hasField($field_name)) {
+      $term->set($field_name, $value);
     }
   }
 
