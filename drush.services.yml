@@ -1,0 +1,6 @@
+services:
+  rs_product_import.commands:
+    class: Drupal\rs_product_import\Commands\ProductImportCommands
+    arguments: ['@entity_type.manager']
+    tags:
+      - { name: drush.command }

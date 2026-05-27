@@ -1,0 +1,8 @@
+/vendor/
+/.idea/
+/.vscode/
+*.log
+*.zip
+*.tar.gz
+.DS_Store
+Thumbs.db

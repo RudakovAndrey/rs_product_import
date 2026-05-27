@@ -1,0 +1,445 @@
+<?php
+
+namespace Drupal\rs_product_import\Commands;
+
+use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\node\Entity\Node;
+use Drupal\taxonomy\TermInterface;
+use Drush\Commands\DrushCommands;
+
+/**
+ * Drush commands for importing legacy product nodes.
+ */
+class ProductImportCommands extends DrushCommands {
+
+  /**
+   * Term roots used to disambiguate repeated legacy category IDs.
+   */
+  private const SOURCE_ROOTS = [
+    'ckt' => [
+      'Запчасти Dongfeng',
+      'Запчасти Shacman',
+      'Запчасти двигателей Cummins',
+      'Запчасти двигателей Weichai',
+    ],
+    'urc_ymz' => [
+      'Двигатели ЯМЗ',
+      'Запчасти ЯМЗ',
+      'Ремкомплекты',
+      'Топливная аппаратура ЯЗДА',
+      'Радиаторы и отопители ШААЗ',
+      'Прочее',
+    ],
+  ];
+
+  /**
+   * Cached taxonomy term lookup by field_old_id.
+   *
+   * @var array<string, \Drupal\taxonomy\TermInterface[]>
+   */
+  protected array $termsByOldId = [];
+
+  /**
+   * Entity type manager.
+   */
+  protected EntityTypeManagerInterface $entityTypeManager;
+
+  public function __construct(EntityTypeManagerInterface $entity_type_manager) {
+    parent::__construct();
+    $this->entityTypeManager = $entity_type_manager;
+  }
+
+  /**
+   * Imports product nodes from data/products.json.
+   *
+   * @command rs-product-import:import
+   * @aliases rspi
+   * @option file JSON file path. Defaults to module data/products.json.
+   * @option limit Maximum number of products to process.
+   * @option offset Number of products to skip from the beginning.
+   * @option update Update existing nodes found by old ID and catalog number.
+   * @option dry-run Validate and print counters without saving nodes.
+   */
+  public function import(array $options = [
+    'file' => NULL,
+    'limit' => NULL,
+    'offset' => 0,
+    'update' => TRUE,
+    'dry-run' => FALSE,
+  ]): void {
+    $products = $this->loadProducts($options);
+    $this->buildTermLookup();
+
+    $created = 0;
+    $updated = 0;
+    $skipped = 0;
+    $missing_categories = 0;
+    $dry_run = (bool) $options['dry-run'];
+    $allow_update = (bool) $options['update'];
+
+    foreach ($products as $product) {
+      if (empty($product['title']) || empty($product['source']) || empty($product['source_id'])) {
+        $skipped++;
+        continue;
+      }
+
+      $node = $this->loadExistingProduct($product);
+      if ($node && !$allow_update) {
+        $skipped++;
+        continue;
+      }
+
+      $is_new = !$node;
+      if (!$node) {
+        $node = Node::create([
+          'type' => 'product',
+          'uid' => 0,
+          'promote' => 1,
+          'sticky' => 0,
+        ]);
+      }
+
+      $category_ids = $this->resolveCategoryTargetIds($product);
+      if (!$category_ids && !empty($product['canonical_category_old_ids'])) {
+        $missing_categories++;
+      }
+
+      $this->fillProductNode($node, $product, $category_ids);
+
+      if (!$dry_run) {
+        $node->save();
+      }
+
+      $is_new ? $created++ : $updated++;
+    }
+
+    $this->printImportSummary(count($products), $created, $updated, $skipped, $missing_categories, $dry_run);
+  }
+
+  /**
+   * Reports how many JSON products can be found as Drupal product nodes.
+   *
+   * @command rs-product-import:status
+   * @option file JSON file path. Defaults to module data/products.json.
+   * @option limit Maximum number of products to check.
+   * @option offset Number of products to skip from the beginning.
+   */
+  public function status(array $options = [
+    'file' => NULL,
+    'limit' => NULL,
+    'offset' => 0,
+  ]): void {
+    $products = $this->loadProducts($options);
+    $storage = $this->entityTypeManager->getStorage('node');
+    $found = 0;
+    $missing = 0;
+    $duplicates = 0;
+    $first_missing = [];
+    $first_duplicates = [];
+
+    foreach ($products as $product) {
+      if (empty($product['source_id']) || empty($product['article'])) {
+        $missing++;
+        continue;
+      }
+
+      $nids = $storage->getQuery()
+        ->condition('type', 'product')
+        ->condition('field_old_id', (int) $product['source_id'])
+        ->condition('field_cat_number', (string) $product['article'])
+        ->accessCheck(FALSE)
+        ->execute();
+
+      $count = count($nids);
+      if ($count === 1) {
+        $found++;
+      }
+      elseif ($count > 1) {
+        $duplicates++;
+        if (count($first_duplicates) < 10) {
+          $first_duplicates[] = ($product['import_key'] ?? $product['source_id']) . ' / ' . $product['article'] . ' => ' . implode(',', $nids);
+        }
+      }
+      else {
+        $missing++;
+        if (count($first_missing) < 10) {
+          $first_missing[] = ($product['import_key'] ?? $product['source_id']) . ' / ' . $product['article'];
+        }
+      }
+    }
+
+    $this->output()->writeln('RS product import status.');
+    $this->output()->writeln('Products checked: ' . count($products));
+    $this->output()->writeln("Found: {$found}");
+    $this->output()->writeln("Missing: {$missing}");
+    $this->output()->writeln("Duplicates: {$duplicates}");
+    $this->printList('First missing:', $first_missing);
+    $this->printList('First duplicates:', $first_duplicates);
+  }
+
+  /**
+   * Loads and slices product data.
+   */
+  protected function loadProducts(array $options): array {
+    $module_path = \Drupal::service('extension.list.module')->getPath('rs_product_import');
+    $file = $options['file'] ?: DRUPAL_ROOT . '/' . $module_path . '/data/products.json';
+    if (!file_exists($file)) {
+      throw new \RuntimeException("Products JSON not found: {$file}");
+    }
+
+    $products = json_decode(file_get_contents($file), TRUE);
+    if (!is_array($products)) {
+      throw new \RuntimeException("Cannot decode products JSON: {$file}");
+    }
+
+    $offset = max(0, (int) ($options['offset'] ?? 0));
+    $limit = $options['limit'] !== NULL ? max(0, (int) $options['limit']) : NULL;
+    return ($offset || $limit !== NULL) ? array_slice($products, $offset, $limit) : $products;
+  }
+
+  /**
+   * Builds a lookup of catalog taxonomy terms keyed by field_old_id.
+   */
+  protected function buildTermLookup(): void {
+    $storage = $this->entityTypeManager->getStorage('taxonomy_term');
+    $tids = $storage->getQuery()
+      ->condition('vid', 'catalog')
+      ->accessCheck(FALSE)
+      ->execute();
+
+    /** @var \Drupal\taxonomy\TermInterface[] $terms */
+    $terms = $storage->loadMultiple($tids);
+    foreach ($terms as $term) {
+      if (!$term->hasField('field_old_id') || $term->get('field_old_id')->isEmpty()) {
+        continue;
+      }
+      $old_id = (string) $term->get('field_old_id')->value;
+      $this->termsByOldId[$old_id][] = $term;
+    }
+  }
+
+  /**
+   * Loads an existing product for safe re-runs.
+   */
+  protected function loadExistingProduct(array $product): ?Node {
+    if (empty($product['source_id'])) {
+      return NULL;
+    }
+
+    $query = $this->entityTypeManager->getStorage('node')->getQuery()
+      ->condition('type', 'product')
+      ->condition('field_old_id', (int) $product['source_id'])
+      ->range(0, 2)
+      ->accessCheck(FALSE);
+
+    if (!empty($product['article'])) {
+      $query->condition('field_cat_number', (string) $product['article']);
+    }
+
+    $nids = $query->execute();
+    return count($nids) === 1 ? $this->entityTypeManager->getStorage('node')->load(reset($nids)) : NULL;
+  }
+
+  /**
+   * Fills product node fields from a normalized product row.
+   */
+  protected function fillProductNode(Node $node, array $product, array $category_ids): void {
+    $title = (string) $product['title'];
+    $node->setTitle($title);
+    $this->setIfFieldExists($node, 'status', (int) ($product['status'] ?? 1));
+    $this->setIfFieldExists($node, 'field_title', $title);
+    $this->setIfFieldExists($node, 'field_display_title', $product['display_title'] ?: $title);
+    $this->setIfFieldExists($node, 'field_old_id', (int) ($product['source_id'] ?? 0));
+    $this->setIfFieldExists($node, 'field_cat_number', (string) ($product['article'] ?? ''));
+    $this->setIfFieldExists($node, 'field_brand', (string) ($product['brand'] ?? ''));
+    $this->setIfFieldExists($node, 'field_stock_available', (int) ($product['stock'] ?? 0));
+    $this->setIfFieldExists($node, 'field_not_for_sale', (int) ($product['not_for_sale'] ?? 0));
+    $this->setIfFieldExists($node, 'field_catalog', $this->targetIdValues($category_ids));
+    $this->setIfFieldExists($node, 'field_parameters_list', '0');
+
+    if ($node->hasField('body')) {
+      $node->set('body', [
+        'value' => (string) ($product['description'] ?? ''),
+        'format' => 'full_html',
+        'summary' => '',
+      ]);
+    }
+    if ($node->hasField('field_parameters')) {
+      $node->set('field_parameters', [
+        'value' => (string) ($product['parameters'] ?? ''),
+        'format' => 'full_html',
+        'summary' => '',
+      ]);
+    }
+    if ($node->hasField('field_features')) {
+      $node->set('field_features', [
+        'value' => (string) ($product['features'] ?? ''),
+        'format' => 'full_html',
+      ]);
+    }
+    if ($node->hasField('field_applicability')) {
+      $node->set('field_applicability', [
+        'value' => (string) ($product['applicability'] ?? ''),
+        'format' => 'full_html',
+      ]);
+    }
+    if ($node->hasField('field_models_applicability')) {
+      $node->set('field_models_applicability', $this->stringValues($product['models_applicability'] ?? []));
+    }
+    if ($node->hasField('field_marks')) {
+      $node->set('field_marks', $this->stringValues($product['marks'] ?? []));
+    }
+
+    $price = $this->formatDecimal((float) ($product['price'] ?? 0));
+    $weight = $this->formatDecimal((float) ($product['weight'] ?? 0));
+    $this->setIfFieldExists($node, 'model', (string) ($product['article'] ?: ($product['import_key'] ?? '0')));
+    $this->setIfFieldExists($node, 'cost', ['value' => '0.00000']);
+    $this->setIfFieldExists($node, 'price', ['value' => $price]);
+    $this->setIfFieldExists($node, 'shippable', 1);
+    $this->setIfFieldExists($node, 'weight', ['value' => $weight, 'units' => 'kg']);
+    $this->setIfFieldExists($node, 'dimensions', ['length' => '0', 'width' => '0', 'height' => '0', 'units' => 'mm']);
+    $this->setIfFieldExists($node, 'pkg_qty', 1);
+    $this->setIfFieldExists($node, 'default_qty', 1);
+    $this->setIfFieldExists($node, 'field_weight_for_sort', (int) round((float) ($product['weight'] ?? 0) * 1000));
+    $this->setIfFieldExists($node, 'field_is_exist_img', !empty($product['images']) ? 1 : 0);
+  }
+
+  /**
+   * Resolves category term IDs and all their ancestors.
+   */
+  protected function resolveCategoryTargetIds(array $product): array {
+    $source = (string) ($product['source'] ?? '');
+    $target_ids = [];
+
+    foreach (($product['canonical_category_old_ids'] ?? []) as $old_id) {
+      $term = $this->findTermByOldId((string) $old_id, $source);
+      if (!$term) {
+        continue;
+      }
+      foreach ($this->termWithAncestors($term) as $tid) {
+        $target_ids[$tid] = $tid;
+      }
+    }
+
+    return array_values($target_ids);
+  }
+
+  /**
+   * Finds a taxonomy term by old ID with source-aware disambiguation.
+   */
+  protected function findTermByOldId(string $old_id, string $source): ?TermInterface {
+    $terms = $this->termsByOldId[$old_id] ?? [];
+    if (!$terms) {
+      return NULL;
+    }
+    if (count($terms) === 1) {
+      return reset($terms);
+    }
+
+    $source_roots = self::SOURCE_ROOTS[$source] ?? [];
+    foreach ($terms as $term) {
+      $root = $this->rootName($term);
+      if ($source_roots && in_array($root, $source_roots, TRUE)) {
+        return $term;
+      }
+      if ($source === 'rs-ural' && !$this->isImportedExternalRoot($root)) {
+        return $term;
+      }
+    }
+
+    return reset($terms);
+  }
+
+  /**
+   * Returns the term ID plus all parent term IDs.
+   */
+  protected function termWithAncestors(TermInterface $term): array {
+    $ids = [];
+    $storage = $this->entityTypeManager->getStorage('taxonomy_term');
+    $current = $term;
+    while ($current instanceof TermInterface) {
+      $ids[] = (int) $current->id();
+      $parent_id = (int) ($current->get('parent')->target_id ?? 0);
+      if (!$parent_id) {
+        break;
+      }
+      $current = $storage->load($parent_id);
+    }
+    return $ids;
+  }
+
+  /**
+   * Gets the top-level root name for a term.
+   */
+  protected function rootName(TermInterface $term): string {
+    $storage = $this->entityTypeManager->getStorage('taxonomy_term');
+    $current = $term;
+    while ($current instanceof TermInterface) {
+      $parent_id = (int) ($current->get('parent')->target_id ?? 0);
+      if (!$parent_id) {
+        return $current->label();
+      }
+      $parent = $storage->load($parent_id);
+      if (!$parent instanceof TermInterface) {
+        return $current->label();
+      }
+      $current = $parent;
+    }
+    return '';
+  }
+
+  /**
+   * Checks whether a root belongs to CKT or URC imported categories.
+   */
+  protected function isImportedExternalRoot(string $root): bool {
+    foreach (self::SOURCE_ROOTS as $roots) {
+      if (in_array($root, $roots, TRUE)) {
+        return TRUE;
+      }
+    }
+    return FALSE;
+  }
+
+  protected function setIfFieldExists(Node $node, string $field_name, $value): void {
+    if ($node->hasField($field_name)) {
+      $node->set($field_name, $value);
+    }
+  }
+
+  protected function targetIdValues(array $ids): array {
+    return array_map(static fn($id): array => ['target_id' => (int) $id], $ids);
+  }
+
+  protected function stringValues(array $values): array {
+    return array_map(static fn($value): array => ['value' => $value], array_filter($values, 'strlen'));
+  }
+
+  protected function formatDecimal(float $value): string {
+    return number_format($value, 5, '.', '');
+  }
+
+  protected function printImportSummary(int $processed, int $created, int $updated, int $skipped, int $missing_categories, bool $dry_run): void {
+    $this->output()->writeln('');
+    $this->output()->writeln('RS product import finished.');
+    $this->output()->writeln("Products processed: {$processed}");
+    $this->output()->writeln("Created: {$created}");
+    $this->output()->writeln("Updated: {$updated}");
+    $this->output()->writeln("Skipped: {$skipped}");
+    $this->output()->writeln("Products with unresolved categories: {$missing_categories}");
+    if ($dry_run) {
+      $this->output()->writeln('Dry run: no nodes were saved.');
+    }
+  }
+
+  protected function printList(string $title, array $items): void {
+    if (!$items) {
+      return;
+    }
+    $this->output()->writeln('');
+    $this->output()->writeln($title);
+    foreach ($items as $item) {
+      $this->output()->writeln('- ' . $item);
+    }
+  }
+
+}

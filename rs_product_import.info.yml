@@ -1,0 +1,8 @@
+name: RS Product Import
+type: module
+description: Imports product nodes from prepared legacy catalog JSON.
+package: Custom
+core_version_requirement: ^9 || ^10
+dependencies:
+  - drupal:node
+  - drupal:taxonomy
