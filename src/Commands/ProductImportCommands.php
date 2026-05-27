@@ -40,6 +40,20 @@ class ProductImportCommands extends DrushCommands {
   protected array $termsByOldId = [];
 
   /**
+   * Existing product lookup keyed by old ID and catalog number.
+   *
+   * Value 0 means the key is duplicated and should not be auto-updated.
+   *
+   * @var array<string, int>
+   */
+  protected array $existingProductNidsByKey = [];
+
+  /**
+   * Number of duplicate old ID/catalog number keys in existing products.
+   */
+  protected int $existingProductDuplicateKeys = 0;
+
+  /**
    * Entity type manager.
    */
   protected EntityTypeManagerInterface $entityTypeManager;
@@ -73,6 +87,7 @@ class ProductImportCommands extends DrushCommands {
   ]): void {
     $products = $this->loadProducts($options);
     $this->buildTermLookup();
+    $this->buildExistingProductLookup();
 
     $created = 0;
     $updated = 0;
@@ -258,18 +273,63 @@ class ProductImportCommands extends DrushCommands {
       return NULL;
     }
 
-    $query = $this->entityTypeManager->getStorage('node')->getQuery()
-      ->condition('type', 'product')
-      ->condition('field_old_id', (int) $product['source_id'])
-      ->range(0, 2)
-      ->accessCheck(FALSE);
-
-    if (!empty($product['article'])) {
-      $query->condition('field_cat_number', (string) $product['article']);
+    $key = $this->existingProductKey($product['source_id'], $product['article'] ?? '');
+    if ($key === '' || empty($this->existingProductNidsByKey[$key])) {
+      return NULL;
     }
 
-    $nids = $query->execute();
-    return count($nids) === 1 ? $this->entityTypeManager->getStorage('node')->load(reset($nids)) : NULL;
+    return $this->entityTypeManager->getStorage('node')->load($this->existingProductNidsByKey[$key]);
+  }
+
+  /**
+   * Builds a fast existing product lookup to avoid one EntityQuery per row.
+   */
+  protected function buildExistingProductLookup(): void {
+    $this->output()->writeln('Building existing product lookup...');
+
+    $database = \Drupal::database();
+    $query = $database->select('node_field_data', 'n');
+    $query->innerJoin('node__field_old_id', 'old_id', 'old_id.entity_id = n.nid');
+    $query->innerJoin('node__field_cat_number', 'cat_number', 'cat_number.entity_id = n.nid');
+    $query->fields('n', ['nid']);
+    $query->fields('old_id', ['field_old_id_value']);
+    $query->fields('cat_number', ['field_cat_number_value']);
+    $query->condition('n.type', 'product');
+    $query->condition('old_id.deleted', 0);
+    $query->condition('cat_number.deleted', 0);
+
+    $rows = 0;
+    foreach ($query->execute() as $row) {
+      $rows++;
+      $key = $this->existingProductKey($row->field_old_id_value, $row->field_cat_number_value);
+      if ($key === '') {
+        continue;
+      }
+      if (isset($this->existingProductNidsByKey[$key])) {
+        if ($this->existingProductNidsByKey[$key] !== 0) {
+          $this->existingProductDuplicateKeys++;
+        }
+        $this->existingProductNidsByKey[$key] = 0;
+        continue;
+      }
+      $this->existingProductNidsByKey[$key] = (int) $row->nid;
+    }
+
+    $this->output()->writeln('Existing product rows scanned: ' . $rows);
+    $this->output()->writeln('Existing product unique lookup keys: ' . count(array_filter($this->existingProductNidsByKey)));
+    $this->output()->writeln('Existing product duplicate lookup keys: ' . $this->existingProductDuplicateKeys);
+  }
+
+  /**
+   * Builds the existing product lookup key.
+   */
+  protected function existingProductKey($old_id, $article): string {
+    $old_id = trim((string) $old_id);
+    $article = trim((string) $article);
+    if ($old_id === '' || $article === '') {
+      return '';
+    }
+    return $old_id . '|' . mb_strtoupper($article);
   }
 
   /**
