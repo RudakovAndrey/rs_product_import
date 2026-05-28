@@ -81,6 +81,15 @@ Check import status:
 drush rs-product-import:status
 ```
 
+Update node body text from `data/node__body.json`:
+
+```bash
+drush rs-product-import:update-body --dry-run
+drush rs-product-import:update-body
+```
+
+The command uses current `entity_id` values as node IDs and updates only the `body` field.
+
 ## Notes
 
 - Products are matched on reruns by `field_old_id` plus `field_cat_number`.

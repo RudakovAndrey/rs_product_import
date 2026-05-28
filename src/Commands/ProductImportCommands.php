@@ -508,6 +508,130 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
+   * Updates node body values from a phpMyAdmin node__body JSON export.
+   *
+   * @command rs-product-import:update-body
+   * @aliases rspib
+   * @option file JSON file path. Defaults to module data/node__body.json.
+   * @option limit Maximum number of body rows to process.
+   * @option offset Number of body rows to skip from the beginning.
+   * @option dry-run Validate and print counters without saving nodes.
+   * @option log-every Print progress every N body rows.
+   * @option check-bundle Skip rows when the JSON bundle differs from the loaded node bundle.
+   * @option save-retries Retry node save this many times on database lock timeout.
+   * @option save-retry-sleep Seconds to wait between save retries.
+   */
+  public function updateBody(array $options = [
+    'file' => NULL,
+    'limit' => NULL,
+    'offset' => 0,
+    'dry-run' => FALSE,
+    'log-every' => 50,
+    'check-bundle' => TRUE,
+    'save-retries' => 3,
+    'save-retry-sleep' => 5,
+  ]): void {
+    $items = $this->loadBodyItems($options);
+    $storage = $this->entityTypeManager->getStorage('node');
+    $dry_run = (bool) ($options['dry-run'] ?? FALSE);
+    $check_bundle = (bool) ($options['check-bundle'] ?? TRUE);
+    $log_every = max(1, (int) ($options['log-every'] ?? 50));
+    $save_retries = max(0, (int) ($options['save-retries'] ?? 3));
+    $save_retry_sleep = max(1, (int) ($options['save-retry-sleep'] ?? 5));
+
+    $processed = 0;
+    $updated = 0;
+    $unchanged = 0;
+    $skipped = 0;
+    $missing = 0;
+    $bundle_mismatch = 0;
+    $missing_body_field = 0;
+
+    $this->output()->writeln('RS body update started.');
+    $this->output()->writeln('Rows selected: ' . count($items));
+    $this->output()->writeln('Dry run: ' . ($dry_run ? 'yes' : 'no'));
+    $this->output()->writeln('Check bundle: ' . ($check_bundle ? 'yes' : 'no'));
+
+    foreach ($items as $index => $item) {
+      $processed++;
+      $entity_id = (int) ($item['entity_id'] ?? 0);
+      $bundle = (string) ($item['bundle'] ?? '');
+      $label = "#{$index} nid={$entity_id} bundle={$bundle}";
+
+      if ($processed === 1 || $processed % $log_every === 0) {
+        $this->output()->writeln("[{$processed}/" . count($items) . "] processing {$label}");
+      }
+
+      if ($entity_id <= 0 || !array_key_exists('body_value', $item)) {
+        $skipped++;
+        $this->output()->writeln("[{$processed}] skipped invalid row {$label}");
+        continue;
+      }
+
+      /** @var \Drupal\node\Entity\Node|null $node */
+      $node = $storage->load($entity_id);
+      if (!$node) {
+        $missing++;
+        $this->output()->writeln("[{$processed}] missing node {$label}");
+        continue;
+      }
+
+      if ($check_bundle && $bundle !== '' && $node->bundle() !== $bundle) {
+        $bundle_mismatch++;
+        $this->output()->writeln("[{$processed}] skipped bundle mismatch {$label}; actual=" . $node->bundle());
+        continue;
+      }
+
+      if (!$node->hasField('body')) {
+        $missing_body_field++;
+        $this->output()->writeln("[{$processed}] skipped node without body field {$label}");
+        continue;
+      }
+
+      $body_value = (string) ($item['body_value'] ?? '');
+      $body_summary = (string) ($item['body_summary'] ?? '');
+      $body_format = (string) ($item['body_format'] ?? 'full_html');
+      if ($body_format === '') {
+        $body_format = 'full_html';
+      }
+
+      $current = $node->get('body')->first();
+      $current_value = $current ? (string) ($current->value ?? '') : '';
+      $current_summary = $current ? (string) ($current->summary ?? '') : '';
+      $current_format = $current ? (string) ($current->format ?? '') : '';
+
+      if ($current_value === $body_value && $current_summary === $body_summary && $current_format === $body_format) {
+        $unchanged++;
+        continue;
+      }
+
+      $node->set('body', [
+        'value' => $body_value,
+        'summary' => $body_summary,
+        'format' => $body_format,
+      ]);
+
+      if (!$dry_run) {
+        $this->saveNodeWithRetries($node, $label, $save_retries, $save_retry_sleep);
+      }
+      $updated++;
+    }
+
+    $this->output()->writeln('');
+    $this->output()->writeln('RS body update finished.');
+    $this->output()->writeln("Rows processed: {$processed}");
+    $this->output()->writeln(($dry_run ? 'Would update' : 'Updated') . ": {$updated}");
+    $this->output()->writeln("Unchanged: {$unchanged}");
+    $this->output()->writeln("Skipped invalid rows: {$skipped}");
+    $this->output()->writeln("Missing nodes: {$missing}");
+    $this->output()->writeln("Bundle mismatches: {$bundle_mismatch}");
+    $this->output()->writeln("Nodes without body field: {$missing_body_field}");
+    if ($dry_run) {
+      $this->output()->writeln('Dry run: no nodes were saved.');
+    }
+  }
+
+  /**
    * Loads and slices product data.
    */
   protected function loadProducts(array $options): array {
@@ -515,16 +639,31 @@ class ProductImportCommands extends DrushCommands {
   }
 
   /**
+   * Loads and slices body export data.
+   */
+  protected function loadBodyItems(array $options): array {
+    return $this->loadJsonItems($options, 'node__body.json', TRUE);
+  }
+
+  /**
    * Loads and slices a module data JSON file.
    */
-  protected function loadJsonItems(array $options, string $default_file): array {
+  protected function loadJsonItems(array $options, string $default_file, bool $allow_phpmyadmin_header = FALSE): array {
     $module_path = \Drupal::service('extension.list.module')->getPath('rs_product_import');
     $file = $options['file'] ?: DRUPAL_ROOT . '/' . $module_path . '/data/' . $default_file;
     if (!file_exists($file)) {
       throw new \RuntimeException("JSON file not found: {$file}");
     }
 
-    $items = json_decode(file_get_contents($file), TRUE);
+    $contents = file_get_contents($file);
+    if ($allow_phpmyadmin_header) {
+      $json_start = strpos($contents, '[');
+      if ($json_start !== FALSE) {
+        $contents = substr($contents, $json_start);
+      }
+    }
+
+    $items = json_decode($contents, TRUE);
     if (!is_array($items)) {
       throw new \RuntimeException("Cannot decode JSON file: {$file}");
     }
