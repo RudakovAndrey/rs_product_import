@@ -588,7 +588,7 @@ class ProductImportCommands extends DrushCommands {
         continue;
       }
 
-      $body_value = (string) ($item['body_value'] ?? '');
+      $body_value = $this->normalizeBodyValue((string) ($item['body_value'] ?? ''));
       $body_summary = (string) ($item['body_summary'] ?? '');
       $body_format = (string) ($item['body_format'] ?? 'full_html');
       if ($body_format === '') {
@@ -643,6 +643,16 @@ class ProductImportCommands extends DrushCommands {
    */
   protected function loadBodyItems(array $options): array {
     return $this->loadJsonItems($options, 'node__body.json', TRUE);
+  }
+
+  /**
+   * Normalizes legacy body HTML before saving it into Drupal.
+   */
+  protected function normalizeBodyValue(string $body_value): string {
+    $body_value = str_replace('\\"', '"', $body_value);
+    $body_value = preg_replace('#https?://rs-ural\.ru/files/#i', '/sites/default/files/', $body_value) ?? $body_value;
+    $body_value = preg_replace('#(?<!/sites/default)/files/#', '/sites/default/files/', $body_value) ?? $body_value;
+    return str_replace('/sites/default/sites/default/files/', '/sites/default/files/', $body_value);
   }
 
   /**
