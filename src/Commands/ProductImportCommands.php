@@ -655,7 +655,26 @@ class ProductImportCommands extends DrushCommands {
     $body_value = str_replace('/sites/default/sites/default/files/', '/sites/default/files/', $body_value);
     $body_value = str_replace('/sites/default/files/sites/default/files/', '/sites/default/files/files/', $body_value);
     $body_value = preg_replace('#/sites/default/files/(?!old_files/)#', '/sites/default/files/old_files/', $body_value) ?? $body_value;
-    return str_replace('/sites/default/files/old_files/old_files/', '/sites/default/files/old_files/', $body_value);
+    $body_value = str_replace('/sites/default/files/old_files/old_files/', '/sites/default/files/old_files/', $body_value);
+    return $this->normalizeFancyboxLinks($body_value);
+  }
+
+  /**
+   * Adds the Fancybox 3 data attribute to legacy gallery links.
+   */
+  protected function normalizeFancyboxLinks(string $body_value): string {
+    return preg_replace_callback('#<a\b([^>]*\bclass=["\'][^"\']*\bfancybox\b[^"\']*["\'][^>]*)>#i', static function (array $matches): string {
+      $attributes = $matches[1];
+      if (preg_match('#\bdata-fancybox\s*=#i', $attributes)) {
+        return $matches[0];
+      }
+
+      $gallery = 'gallery';
+      if (preg_match('#\brel=["\']([^"\']+)["\']#i', $attributes, $rel_matches)) {
+        $gallery = $rel_matches[1];
+      }
+      return '<a' . $attributes . ' data-fancybox="' . htmlspecialchars($gallery, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
+    }, $body_value) ?? $body_value;
   }
 
   /**
