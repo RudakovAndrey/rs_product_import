@@ -4,5 +4,8 @@
 *.log
 *.zip
 *.tar.gz
+/old_files/
+/old_files_download_*.json
+/old_files_final_report.json
 .DS_Store
 Thumbs.db

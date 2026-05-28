@@ -651,8 +651,11 @@ class ProductImportCommands extends DrushCommands {
   protected function normalizeBodyValue(string $body_value): string {
     $body_value = str_replace('\\"', '"', $body_value);
     $body_value = preg_replace('#https?://rs-ural\.ru/files/#i', '/sites/default/files/', $body_value) ?? $body_value;
-    $body_value = preg_replace('#(?<!/sites/default)/files/#', '/sites/default/files/', $body_value) ?? $body_value;
-    return str_replace('/sites/default/sites/default/files/', '/sites/default/files/', $body_value);
+    $body_value = preg_replace('#((?:href|src)=["\'])/files/#i', '$1/sites/default/files/', $body_value) ?? $body_value;
+    $body_value = str_replace('/sites/default/sites/default/files/', '/sites/default/files/', $body_value);
+    $body_value = str_replace('/sites/default/files/sites/default/files/', '/sites/default/files/files/', $body_value);
+    $body_value = preg_replace('#/sites/default/files/(?!old_files/)#', '/sites/default/files/old_files/', $body_value) ?? $body_value;
+    return str_replace('/sites/default/files/old_files/old_files/', '/sites/default/files/old_files/', $body_value);
   }
 
   /**
